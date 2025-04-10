@@ -1,5 +1,6 @@
 ---
-- name: Find unused Cisco ports with exclusions and generate report
+- hosts: 
+  name: Find unused Cisco ports with exclusions and generate report
   hosts: cisco_switches
   gather_facts: no
   vars:
