@@ -1,0 +1,112 @@
+---
+- name: Find and disable unused Cisco ports
+  hosts: cisco_switches
+  gather_facts: no
+  vars:
+    unused_threshold_days: 90  # 3 месяца в днях
+    target_vlan: "6"
+    shutdown_description: "LSHUT"
+    excluded_descriptions: ["NO LSHUT"]
+    report_path: "/var/lib/awx/projects/reports/port_shutdown_report_{{ ansible_date_time.date }}.csv"
+
+  tasks:
+    - name: Gather interface and VLAN information
+      cisco.ios.ios_facts:
+        gather_subset:
+          - interfaces
+          - interfaces_vlan
+      register: ios_facts
+
+    - name: Extract interface and VLAN information
+      set_fact:
+        interfaces: "{{ ios_facts.ansible_facts.ansible_net_interfaces }}"
+        vlans: "{{ ios_facts.ansible_facts.ansible_net_interfaces_vlan }}"
+
+    - name: Identify trunk ports
+      set_fact:
+        trunk_ports: "{{ vlans | dict2items | selectattr('value.mode', 'equalto', 'trunk') | map(attribute='key') | list }}"
+
+    - name: Find unused interfaces to shutdown
+      set_fact:
+        interfaces_to_disable: |
+          {% set result = [] %}
+          {% for intf, data in interfaces.items() %}
+            {% set is_trunk = intf in trunk_ports %}
+            {% set desc_contains_exclusion = excluded_descriptions | select('in', data.description | default('')) | list | length > 0 %}
+            
+            {% if not is_trunk and not desc_contains_exclusion %}
+              {% if data.last_input is defined and data.last_input != 'never' %}
+                {% set last_used = (now().strftime('%s') | int) - (data.last_input | int) %}
+                {% if last_used > (unused_threshold_days * 86400) %}
+                  {% set _ = result.append({
+                    'name': intf,
+                    'current_vlan': data.vlan | default('N/A'),
+                    'current_desc': data.description | default('')
+                  }) %}
+                {% endif %}
+              {% elif data.operstatus == 'down' and not intf.startswith('Vlan') %}
+                {% set _ = result.append({
+                  'name': intf,
+                  'current_vlan': data.vlan | default('N/A'),
+                  'current_desc': data.description | default('')
+                }) %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          {{ result }}
+
+    - name: Create report directory
+      delegate_to: localhost
+      become: yes
+      file:
+        path: "/var/lib/awx/projects/reports"
+        state: directory
+        mode: '0755'
+
+    - name: Initialize CSV report
+      delegate_to: localhost
+      copy:
+        dest: "{{ report_path }}"
+        content: "Device,Interface,Action,Previous VLAN,Previous Description,Status\n"
+      when: interfaces_to_disable | length > 0
+
+    - name: Disable unused interfaces
+      cisco.ios.ios_config:
+        parents: "interface {{ item.name }}"
+        lines:
+          - switchport access vlan {{ target_vlan }}
+          - description {{ shutdown_description }}
+          - shutdown
+        save_when: modified
+      loop: "{{ interfaces_to_disable }}"
+      register: shutdown_results
+      when: interfaces_to_disable | length > 0
+
+    - name: Record shutdown actions in report
+      delegate_to: localhost
+      lineinfile:
+        path: "{{ report_path }}"
+        line: "{{ inventory_hostname }},{{ item.item.name }},Disabled,{{ item.item.current_vlan }},\"{{ item.item.current_desc }}\",{% if item.changed %}Success{% else %}Failed{% endif %}"
+        create: no
+      loop: "{{ shutdown_results.results }}"
+      when: 
+        - interfaces_to_disable | length > 0
+        - shutdown_results is defined
+
+    - name: Display summary
+      debug:
+        msg: |
+          {% if interfaces_to_disable | length > 0 %}
+          Disabled {{ interfaces_to_disable | length }} interfaces on {{ inventory_hostname }}:
+          {% for intf in interfaces_to_disable %}
+            - {{ intf.name }} (VLAN {{ intf.current_vlan }} -> {{ target_vlan }}, Desc: "{{ shutdown_description }}")
+          {% endfor %}
+          {% else %}
+          No unused interfaces to disable on {{ inventory_hostname }}
+          {% endif %}
+
+    - name: Final report location
+      run_once: yes
+      delegate_to: localhost
+      debug:
+        msg: "Port shutdown report generated at {{ report_path }}"
