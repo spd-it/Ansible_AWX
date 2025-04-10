@@ -76,7 +76,6 @@
         lines:
           - switchport access vlan {{ target_vlan }}
           - description {{ shutdown_description }}
-          - shutdown
         save_when: modified
       loop: "{{ interfaces_to_disable }}"
       register: shutdown_results
