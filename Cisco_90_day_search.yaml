@@ -1,0 +1,114 @@
+---
+- name: Find unused Cisco ports with exclusions and generate report
+  hosts: cisco_switches
+  gather_facts: no
+  vars:
+    unused_threshold_days: 90  # 3 месяца в днях
+    report_path: "/var/lib/awx/projects/reports/unused_ports_report_{{ ansible_date_time.date }}.csv"
+    excluded_descriptions: ["NO LSHUT"]
+
+  tasks:
+    - name: Gather interface and VLAN information from Cisco devices
+      cisco.ios.ios_facts:
+        gather_subset:
+          - interfaces
+          - interfaces_vlan
+      register: ios_facts
+
+    - name: Extract interface and VLAN information
+      set_fact:
+        interfaces: "{{ ios_facts.ansible_facts.ansible_net_interfaces }}"
+        vlans: "{{ ios_facts.ansible_facts.ansible_net_interfaces_vlan }}"
+
+    - name: Identify trunk ports
+      set_fact:
+        trunk_ports: "{{ vlans | dict2items | selectattr('value.mode', 'equalto', 'trunk') | map(attribute='key') | list }}"
+
+    - name: Filter and process unused interfaces
+      block:
+        - name: Calculate last used time and filter interfaces
+          set_fact:
+            unused_interfaces: |
+              {% set result = [] %}
+              {% for intf, data in interfaces.items() %}
+                {% set is_trunk = intf in trunk_ports %}
+                {% set desc_contains_exclusion = excluded_descriptions | select('in', data.description | default('')) | list | length > 0 %}
+                
+                {% if not is_trunk and not desc_contains_exclusion %}
+                  {% if data.last_input is defined and data.last_input != 'never' %}
+                    {% set last_used = (now().strftime('%s') | int) - (data.last_input | int) %}
+                    {% if last_used > (unused_threshold_days * 86400) %}
+                      {% set _ = result.append({
+                        'device': inventory_hostname,
+                        'interface': intf,
+                        'last_used_days': (last_used / 86400) | round(1),
+                        'description': data.description | default('N/A'),
+                        'status': data.operstatus,
+                        'vlan': data.vlan | default('N/A'),
+                        'speed': data.bandwidth | default('N/A'),
+                        'duplex': data.duplex | default('N/A'),
+                        'last_input': data.last_input,
+                        'last_output': data.last_output | default('N/A')
+                      }) %}
+                    {% endif %}
+                  {% elif data.operstatus == 'down' %}
+                    {% set _ = result.append({
+                      'device': inventory_hostname,
+                      'interface': intf,
+                      'last_used_days': 'never',
+                      'description': data.description | default('N/A'),
+                      'status': data.operstatus,
+                      'vlan': data.vlan | default('N/A'),
+                      'speed': data.bandwidth | default('N/A'),
+                      'duplex': data.duplex | default('N/A'),
+                      'last_input': 'never',
+                      'last_output': 'never'
+                    }) %}
+                  {% endif %}
+                {% endif %}
+              {% endfor %}
+              {{ result }}
+
+        - name: Create report directory if not exists
+          delegate_to: localhost
+          become: yes
+          file:
+            path: "/var/lib/awx/projects/reports"
+            state: directory
+            mode: '0755'
+
+        - name: Generate CSV report header
+          delegate_to: localhost
+          copy:
+            dest: "{{ report_path }}"
+            content: "Device,Interface,Status,Description,VLAN,Last Used (days),Speed,Duplex,Last Input,Last Output\n"
+          when: unused_interfaces | length > 0
+
+        - name: Append data to CSV report
+          delegate_to: localhost
+          lineinfile:
+            path: "{{ report_path }}"
+            line: >-
+              {{ item.device }},{{ item.interface }},{{ item.status }},
+              "{{ item.description }}",{{ item.vlan }},{{ item.last_used_days }},
+              {{ item.speed }},{{ item.duplex }},{{ item.last_input }},{{ item.last_output }}
+            create: no
+          loop: "{{ unused_interfaces }}"
+          when: unused_interfaces | length > 0
+
+        - name: Display summary information
+          debug:
+            msg: |
+              Found {{ unused_interfaces | length }} unused interfaces on {{ inventory_hostname }}.
+              Report generated at {{ report_path }}
+
+        - name: No unused interfaces found on this device
+          debug:
+            msg: "No unused interfaces found on {{ inventory_hostname }} (excluding trunks and ports with excluded descriptions)."
+          when: unused_interfaces | length == 0
+
+    - name: Display report location after playbook completion
+      run_once: yes
+      delegate_to: localhost
+      debug:
+        msg: "Unused ports report generated at {{ report_path }}"
